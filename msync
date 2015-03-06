@@ -1,0 +1,53 @@
+#!/bin/sh
+
+xrandr_map() {
+    echo $1 | sed 's/^card0-\([^-]*\)\(-[A-Z]\)\?-\([0-9]\)$/\1\3/'
+}
+
+args() {
+    sed -n 's/^'"$1"' *= *\(.*\) *$/\1/p' "$HOME/.monitors"
+}
+
+# -a also includes connected and enabled monitors
+sync() {
+    all=
+    [ "$1" = -a ] && all=1
+    cd /sys/class/drm
+    xrandr_args=
+    for plug in card0-*; do
+        state="`cat $plug/status`:`cat $plug/enabled`"
+        plug="`xrandr_map $plug`"
+        case "$state" in
+            disconnected:disabled)
+                echo "Skipping $plug" >&2
+                ;;
+            connected:enabled)
+                if [ "$all" ]; then
+                    echo "Refreshing $plug" >&2
+                    xrandr_args="$xrandr_args --output $plug --auto `args "$plug"`"
+                else
+                    echo "Skipping $plug" >&2
+                fi
+                ;;
+            disconnected:enabled) # Turn off lingering monitors
+                echo "Disabling $plug" >&2
+                xrandr_args="$xrandr_args --output $plug --off"
+                ;;
+            connected:disabled) # Turn on new monitors
+                echo "Enabling $plug" >&2
+                xrandr_args="$xrandr_args --output $plug --auto `args "$plug"`"
+                ;;
+            *)
+                echo "Unknown state for $plug: '$state'" >&2
+                return 1
+        esac
+    done
+    if [ "$xrandr_args" ]; then
+        echo "xrandr$xrandr_args" >&2
+        xrandr $xrandr_args
+    fi
+    return 0
+}
+
+sync $1
+
