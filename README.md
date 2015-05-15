@@ -40,3 +40,4 @@ static Key keys[] = {
 
 I also have `msync -a` at the start of my `~/.xsession`.
 
+Copyright © 2015 Andrew Hills. See LICENSE for details.
