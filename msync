@@ -1,10 +1,151 @@
-#!/bin/sh
+#!/bin/sh -e
 
-args() {
-    sed -n 's/^'"$1"' *= *\(.*\) *$/\1/p' "$HOME/.monitors"
+set -e
+
+pn="${0##*/}"
+configfile="${MSYNC_CONFIG:-$HOME/.monitors}"
+
+usage() {
+	[ $# -eq 0 ] || echo "error: $pn: $*" >&2
+	cat <<-EOF
+	usage: $pn [-v] [-d] -l
+	       $pn [-v] [-d] [-n | -s] [monitors…]
+
+	options:
+	  -h  you're reading it
+	  -v  verbose output
+	  -d  debug output
+	  -n  dry run
+	  -l  list connected monitors
+	  -s  show matching configuration
+
+	if neither -l nor -s is specified, synchronizes monitor state with matching
+	configuration (see -s) using the arguments as randr monitor names on which to
+	operate, or all connected monitors if no arguments are specified (see -l)
+
+	configuration is read from \$MSYNC_CONFIG, or ~/.monitors by default; syntax:
+	  * leading and trailing whitespace, as well as entire lines not matching any
+	    configuration, are ignored
+	  * each line specifies "name = value" sections, delimited by pipes (|),
+	    where the name is the monitor name and the value is the set of xrandr
+	    output arguments (e.g., --off, --mode 2560x1440, etc)
+	  * only lines with all active monitors (either connected or specified on the
+	    command line) will match
+	  * two special lines, starting with the words "before" and "after", can have
+	    a command after a $ symbol to be run just before and just after the
+	    xrandr command is run
+
+	example configuration file:
+
+	  these "comment" lines that are not valid configurations will be ignored
+
+	  enable eDP1 and set it as the primary display when it's the only one
+	  eDP1 = --primary
+
+	  when DP2 is present, make it the primary display, and disable eDP1
+	  eDP1 = --off | DP2 = --primary
+
+	  when DP1 is present, put it left of eDP1, unless DP2 is present
+	  eDP1 = --primary | DP1 = --left-of eDP1
+	  eDP1 = --primary | DP1 = --left-of DP2 | DP2 = --left-of eDP1
+
+	  ensure background is properly resized
+	  after $ ~/.fehbg
+
+	EOF
+	exit 1
 }
 
-monitors() {
+action=sync
+dryrun=
+verbose=
+debug=
+while getopts hlsnvd arg; do
+	case "$arg" in
+		l) action=list ;;
+		s) action=show ;;
+		n) dryrun=dryrun ;;
+		v) verbose=verbose ;;
+		d) debug=debug ;;
+		*) usage ;;
+	esac
+done
+shift $((OPTIND - 1))
+
+# config parsing
+
+_ws='[[:space:]]*'      # whitespace
+_mon='[^|=[:space:]]\+' # monitor name
+_flg='[^|=]\+'          # monitor flags
+_other="$_ws$_mon$_ws=$_ws$_flg$_ws"
+
+# stdin is configfile contents; only arg is monitor name
+monitor_matches() {
+	[ $# -eq 1 ] || return 1
+
+	sed -n -e "/^\\($_other|\\)*$_ws$1$_ws=$_ws\\($_flg\\)\\?$_ws\\(|$_other\\)*\$/p"
+}
+
+# stdin is configuration line; only arg is monitor name
+monitor_args() {
+	[ $# -eq 1 ] || return 1
+
+	sed -n -e "s/^\\($_other|\\)*$_ws$1$_ws=$_ws\\($_flg\\)\\?$_ws\\(|$_other\\)*\$/\\2/p"
+}
+
+# stdin is configfile contents; only arg is command category
+config_commands() {
+	[ $# -eq 1 ] || return 1
+	sed -n -e "s/^$_ws$1$_ws\\\$$_ws\(.*\)$_ws\$/\\1/p"
+}
+
+# stdin is configfile contents; args are monitor names
+config_match() {
+	[ $# -gt 0 ] || return 1
+
+	local t=$(mktemp --tmpdir -d "$pn.XXXXXX")
+	[ -z "$verbose" ] || echo "tmpdir: $t" >&2
+
+	# aggregate common lines
+	cat > "$t/config"
+	local prev_monitor= all_monitors_pattern=
+	for monitor; do
+		monitor_matches "$monitor" < "$t/config" | sort > "$t/$monitor"
+
+		if [ -n "$prev_monitor" ]; then
+			comm -12 "$t/prev" "$t/$monitor" > "$t/next"
+		else
+			cat "$t/$monitor" > "$t/next"
+		fi
+
+		mv "$t/next" "$t/prev"
+		prev_monitor="$monitor"
+	done
+
+	# filter for lines with exactly the right number of sections
+	while read line; do
+		local sections=$(echo "$line" | tr -dc \| | wc -c)
+		[ $((sections + 1)) -eq $# ] || continue
+		echo "$line"
+	done < "$t/prev" > "$t/match"
+
+	local matches=$(wc -l < "$t/match")
+	[ -z "$verbose" ] || echo "matches: $matches" >&2
+
+	# no match
+	if [ "$matches" -le 0 ]; then
+		#TODO rm -rf "$t"
+		echo "error: $pn: no matching configuration for monitors: $*" >&2
+		return 1
+	fi
+
+	# use last match if multiple definitions are found
+	tail -1 "$t/match"
+
+	rm -rf "$t"
+}
+
+connected_monitors() {
 		xrandr | awk '/ connected/{print $1}'
 }
 
@@ -12,27 +153,65 @@ disconnected_monitors() {
 		xrandr | awk '/ disconnected/{print $1}'
 }
 
-# -a also includes connected and enabled monitors
-sync() {
-    all=
-    [ "$1" = -a ] && all=1
-    xrandr_args=
-    for monitor in `monitors`; do
-				xrandr_args="$xrandr_args --output $monitor --auto `args "$monitor"`"
-				echo "+$monitor"
-    done
-		for monitor in `disconnected_monitors`; do
-				xrandr_args="$xrandr_args --output $monitor --off"
-				echo "-$monitor"
-		done
-    if [ "$xrandr_args" ]; then
-        echo "xrandr$xrandr_args" >&2
-        xrandr $xrandr_args
-    fi
-    return 0
+# actions
+
+msync_list() {
+	[ $# -eq 0 ] || usage 'no arguments allowed when listing connected monitors'
+
+	connected_monitors
 }
 
-sh -x -c "`args before`"
-sync $1
-sh -x -c "`args after`"
+msync_show() {
+	[ $# -gt 0 ] || set -- $(connected_monitors)
+
+	config_match "$@" < "$configfile"
+}
+
+msync_sync() {
+	local xrandr_args= disconnected= status=0
+	if [ $# -eq 0 ]; then
+		disconnected=disconnected
+		set -- $(connected_monitors)
+	fi
+
+	# "before" commands
+	local before=$(config_commands before < "$configfile")
+	[ -z "$before" -o \( -z "$dryrun" -a -z "$verbose" \) ] || echo "\$ $before" >&2
+	[ -z "$before" -o -n "$dryrun" ] || sh${verbose:+ -x} -c "$before" before "$@" || status=$?
+
+	# monitors
+	local config=$(config_match "$@" < "$configfile") || return $?
+	[ -z "$verbose" ] || echo "config: $config" >&2
+
+	for monitor; do
+		local monitor_args=$(echo "$config" | monitor_args "$monitor") || return $?
+		xrandr_args="${xrandr_args:+$xrandr_args }--output $monitor --auto${monitor_args:+ $monitor_args}"
+		echo "+$monitor"
+	done
+
+	if [ -n "$disconnected" ]; then
+		set -- $(disconnected_monitors)
+
+		for monitor; do
+			xrandr_args="${xrandr_args:+$xrandr_args }--output $monitor --off"
+			[ -z "$verbose" ] || echo "-$monitor"
+		done
+	fi
+
+	[ -z "$xrandr_args" -o \( -z "$dryrun" -a -z "$verbose" \) ] || echo "\$ xrandr $xrandr_args" >&2
+	[ -z "$xrandr_args" -o -n "$dryrun" ] || xrandr $xrandr_args || status=$?
+
+	# "after" commands
+
+	local after=$(config_commands after < "$configfile")
+	[ -z "$after" -o \( -z "$dryrun" -a -z "$verbose" \) ] || echo "\$ $after" >&2
+	[ -z "$after" -o -n "$dryrun" ] || sh${verbose:+ -x} -c "$after" after "$@" || status=$?
+
+	return $status
+}
+
+[ -z "$debug" ] || set -x
+
+"msync_$action" "$@"
+exit $?
 
